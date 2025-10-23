@@ -4,6 +4,7 @@
 
 WANT_JSON="1"
 PARAMS="
+    autocommit/bool
     command=cmd/str
     config/str
     find=find_by=search/any
@@ -25,7 +26,6 @@ init() {
     state_path=""
     [ -z "$_ansible_check_mode" ] || state_path="$(mktemp -d)" ||
         fail "could not create state path"
-    uci="/sbin/uci${state_path:+ -P '${state_path//'/'\\''}'}"
     changes="$(uci_change_hash)"
     case "$_type_keep_keys" in
         object) fail "keep_keys must be list or string";;
@@ -37,15 +37,22 @@ init() {
             config="$1"; section="$2"; option="$3"; }
     [ -z "$_ansible_diff" -o -z "$config" ] ||
         set_diff "$(uci export "$config")"
-    [ -n "$command" ]  || { [ -z "$value" ] && command="get" || command="set"; }
+    [ -n "$command" ] || { [ -z "$value" ] && command="get" || command="set"; }
 }
 
 uci() {
-    eval "command $uci \"\$@\""
+    [ -z "$state_path" ] || set -- -P "$state_path" "$@"
+    command uci "$@"
 }
 
 uci_change_hash() {
     uci changes | md5
+}
+
+uci_result_do() {
+    json_set_namespace result
+    "$@"
+    json_set_namespace params
 }
 
 uci_get_safe() {
@@ -166,9 +173,11 @@ uci_find() {
             json_select_real find
             json_get_keys keys;;
         *)
-            [ -n "$config" -a -n "$type" -a -n "$option" ] ||
+            [ -n "$config" -a -n "$type" ] &&
+                [ -n "$option" -o "$command" = find_all ] ||
                 fail "config, type and option required for $command";;
     esac
+    [ "$command" != "find_all" ] || uci_result_do json_add_array result
     type="${type:-$section}"
     section=""; i=0
     while [ -n "$(uci -q get "$config.@$type[$i]")" ]; do
@@ -202,20 +211,29 @@ uci_find() {
                     esac
                 done;;
             *)
-                v="$(uci -q get "$config.$c.$option")" &&
-                    [ -z "$find" -o "$find" = "$v" ] || continue;;
+                [ -z "$option" ] || {
+                    v="$(uci -q get "$config.$c.$option")" &&
+                        [ -z "$find" -o "$find" = "$v" ] || continue
+                };;
         esac
-        section="$c"; break
+        [ "$command" = "find_all" ] || { section="$c"; break; }
+        uci_result_do json_add_string . "$c"
     done
     case "$_type_find" in
         array|object) json_select ..;;
     esac
-    _result="$section"
-    [ -n "$section" ] && return 0 || return 1
+    case "$command" in
+        find_all)
+            uci_result_do json_close_array
+            _result="";;
+        *)
+            _result="$section"
+            [ -n "$section" ] && return 0 || return 1;;
+    esac
 }
 
 uci_ensure() {
-    local keys i c v k t
+    local keys k v
     [ -n "$name" -o -z "$type" ] || name="$section"
     type="${type:-$section}"
     [ -n "$config" -a -n "$type" ] ||
@@ -223,10 +241,31 @@ uci_ensure() {
     [ -n "$name" ] && uci_check_type "$config.$name" "$type" || {
         [ "$_type_find" = "object" -o -n "$option" ] && uci_find && {
             [ -z "$name" ] || try uci rename "$config.$section=$name"
-        } || uci_add
+        } || {
+            [ "$command" = absent ] && return 0 || uci_add
+        }
     }
     section="${name:-$_result}"
     key="$config.$section${option:+.$option}"
+    [ "$command" = "absent" ] && {
+        [ -z "$_defined_value" ] &&
+            { uci -q delete "$key" || :; } ||
+            case "$_type_value" in
+                array|object)
+                    json_select_real value
+                    json_get_keys keys
+                    for k in $keys; do
+                        json_get_var v "$k"
+                        case "$_type_value" in
+                            array) uci -q delete "$config.$section.$v";;
+                            object) uci -q delete "$config.$section.$k=$v";;
+                        esac
+                    done
+                    json_select ..;;
+                *) uci -q delete "$config.$section.$value";;
+            esac
+        return 0
+    }
     [ -z "$set_find" -o "$_type_find" != "object" -a -z "$option" ] || {
         uci_set find
         [ "$_type_value" != "object" ] || {
@@ -255,6 +294,20 @@ uci_cleanup_section() {
     done
 }
 
+uci_revert() {
+    [ -z "$key" ] && rm -f -- "/tmp/.uci"/* 2>/dev/null || uci revert "$key"
+}
+
+uci_autocommit() {
+    [ -n "$autocommit" ] || return 0
+    case "$command" in
+        commit|revert) return 0;;
+    esac
+    [ "$1" -eq 0 ] && {
+        [ -n "$config" ] && uci commit "$config" || uci commit
+    } || uci_revert
+}
+
 main() {
     case "$command" in
         batch|import)
@@ -262,7 +315,7 @@ main() {
         add_list|del_list|rename|reorder)
             [ -n "$key" -a -n "$value" ] ||
                 fail "key and value required for $command";;
-        add|get|delete|ensure)
+        add|get|delete|ensure|absent)
             [ -n "$key" ] || fail "key required for $command";;
     esac
     case "$command" in
@@ -292,20 +345,25 @@ main() {
         rename)
             final uci $command "$key=${name:-$value}";;
         revert)
-            [ -z "$key" ] && final rm -f -- "/tmp/.uci"/* 2>/dev/null ||
-                final uci $command "$key";;
+            final uci_revert;;
         set)
             uci_set; exit 0;;
-        find)
+        find|find_all)
             uci_find; exit $?;;
         ensure|section)
+            uci_ensure; exit 0;;
+        absent)
+            [ -n "$_defined_find" ] || {
+                uci -q delete "$key${value:+=$value}"; exit 0
+            }
             uci_ensure; exit 0;;
         *) fail "unknown command: $command";;
     esac
 }
 
 cleanup() {
-    [ "$1" -ne 0 ] || uci_cleanup_section
+    local ec="$1"
+    [ "$ec" -ne 0 ] || uci_cleanup_section
     [ "$changes" = "$(uci_change_hash)" ] || {
         changed
         [ "$_ansible_verbosity" -lt 2 ] || {
@@ -317,6 +375,7 @@ cleanup() {
             json_close_array
             json_set_namespace params
         }
+        uci_autocommit "$ec"
     }
     [ -z "$_ansible_diff" -o -z "$config" ] ||
         set_diff "" "$(uci export "$config")"

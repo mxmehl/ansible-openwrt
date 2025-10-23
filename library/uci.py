@@ -15,11 +15,17 @@ description:
   - It supports all the command line functionality plus some extra commands.
 author: Markus Weippert (@gekmihesg)
 options:
+  autocommit:
+    description:
+      - Whether to automatically commit changes
+    type: bool
+    default: false
   command:
     description:
       - Command to execute. Execution takes place in a shell.
     default: set if value else get
     choices:
+      - absent
       - add
       - add_list
       - batch
@@ -126,6 +132,25 @@ EXAMPLES = '''
       encryption: none
     replace: yes
 
+# Find a matching wifi-iface and delete it.
+- uci:
+    command: absent
+    config: wireless
+    type: wifi-iface
+    find:
+      ssid: My SSID broken
+
+# Find a matching wifi-iface and delete the options key and encryption.
+- uci:
+    command: absent
+    config: wireless
+    type: wifi-iface
+    find:
+      ssid: My SSID public
+    value:
+      - key
+      - encryption
+
 # commit changes and notify
 - uci: cmd=commit
   notify: restart wifi
@@ -150,7 +175,7 @@ section:
     description: section part of I(key)
     returned: when given
     type: string
-    sample: @wifi-iface[0]
+    sample: '@wifi-iface[0]'
 option:
     description: option part of I(key)
     returned: when given

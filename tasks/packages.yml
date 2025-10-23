@@ -1,7 +1,7 @@
 ---
 - name: check whether opkg caches need update
   stat:
-    path: /tmp/opkg-lists
+    path: "{{ openwrt_remote_opkg_lists_dir }}"
   register: _opkg_lists
 
 - name: get current system time
@@ -14,7 +14,7 @@
 - name: update opkg cache
   opkg:
     name: opkg
-    update_cache: yes
+    update_cache: true
   register: _update
   when: not _opkg_lists.stat.exists or
       _epoch.stdout|int - _opkg_lists.stat.mtime > 86400
@@ -33,7 +33,7 @@
     base64: coreutils-base64
     md5sum: coreutils-md5sum
     sha1sum: coreutils-sha1sum
-  when: _openssl.rc
+  when: _openssl.rc != 0
 
 - name: avoid re-checking of packages
   set_fact:
